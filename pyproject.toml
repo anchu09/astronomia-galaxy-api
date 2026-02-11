@@ -1,0 +1,55 @@
+[project]
+name = "astronomia-agentic-chatbot"
+version = "0.1.0"
+description = "Monorepo scaffold for an agentic galaxy analysis backend."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116.0",
+  "uvicorn>=0.35.0",
+  "pydantic>=2.11.0",
+  "numpy>=2.3.0",
+  "pillow>=11.3.0",
+  "requests>=2.32.0",
+  "langchain>=0.3.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0",
+  "ruff>=0.12.0",
+  "black>=24.8.0",
+  "mypy>=1.11.0",
+  "pre-commit>=3.8.0",
+  "types-requests>=2.32.4",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+  ".venv",
+  "artifacts",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Header"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+exclude = [
+  "artifacts",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
