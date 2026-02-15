@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from packages.galaxy_agent.artifacts import ArtifactStore
+from packages.galaxy_agent.langchain_backend import LangChainBackend
 from packages.galaxy_agent.models import AnalyzeRequest, AnalyzeResponse, Artifact, Provenance
 from packages.galaxy_agent.tools import (
     load_image,
@@ -31,10 +32,26 @@ def _ssl_verify() -> bool:
     return val not in ("0", "false", "no", "off")
 
 
+def _last_user_message(request: AnalyzeRequest) -> str:
+    """Último mensaje del usuario para que el agente responda a lo que preguntó."""
+    msgs = request.get_normalized_messages()
+    if msgs:
+        last_user = next((m.content for m in reversed(msgs) if m.role == "user"), None)
+        if last_user:
+            return last_user
+    return request.message or ""
+
+
 class TaskOrchestrator:
-    def __init__(self, analyzer: BasicGalaxyAnalyzer, artifact_store: ArtifactStore) -> None:
+    def __init__(
+        self,
+        analyzer: BasicGalaxyAnalyzer,
+        artifact_store: ArtifactStore,
+        langchain_backend: LangChainBackend | None = None,
+    ) -> None:
         self.analyzer = analyzer
         self.artifact_store = artifact_store
+        self.langchain_backend = langchain_backend
 
     def run(self, request: AnalyzeRequest, langsmith_enabled: bool) -> AnalyzeResponse:
         for event in self.run_stream(request, langsmith_enabled):
@@ -68,31 +85,63 @@ class TaskOrchestrator:
         if request.image_url:
             artifacts.append(Artifact(type="image", path=request.image_url))
 
-        yield {"type": "status", "message": "Segmentando imagen…"}
-        image = load_image(request.image_url)
-        segmentation = tool_segment(self.analyzer, image)
-        artifacts.append(self.artifact_store.save_mask(request.request_id, segmentation.mask))
+        if request.task == "fetch_image":
+            # Solo imagen: respuesta concisa. Siempre indicar banda efectiva (p. ej. visible por defecto)
+            # para que en el siguiente turno el usuario/LLM sepan qué banda se usó.
+            target_name = (request.target and request.target.name) or "galaxia"
+            opts = request.options or {}
+            band = opts.get("band")
+            effective_band = str(band) if band else "visible"  # default en _resolve_fetch = SDSS
+            user_message = _last_user_message(request)
+            if self.langchain_backend:
+                summary = self.langchain_backend.generate_image_caption(
+                    target_name=str(target_name),
+                    band=effective_band,
+                    user_message=user_message or None,
+                )
+            else:
+                summary = f"Aquí tienes la imagen de {target_name} en banda {effective_band}."
+            results = {}
+        else:
+            # Análisis: segmentación, medidas y opcionalmente resumen morfológico
+            yield {"type": "status", "message": "Segmentando imagen…"}
+            image = load_image(request.image_url)
+            segmentation = tool_segment(self.analyzer, image)
+            artifacts.append(self.artifact_store.save_mask(request.request_id, segmentation.mask))
 
-        results: dict[str, Any] = {"segmentation_metadata": segmentation.metadata}
-        summary = "Segmentation completed."
+            results = {"segmentation_metadata": segmentation.metadata}
+            summary = "Segmentation completed."
 
-        if request.task in ("measure_basic", "morphology_summary"):
-            yield {"type": "status", "message": "Calculando medidas…"}
-            measurements = tool_measure_basic(self.analyzer, image, segmentation.mask)
-            results["measurements"] = measurements
-            artifacts.append(
-                self.artifact_store.save_measurements(request.request_id, measurements)
-            )
-            summary = "Basic measurements computed."
+            if request.task in ("measure_basic", "morphology_summary"):
+                yield {"type": "status", "message": "Calculando medidas…"}
+                measurements = tool_measure_basic(self.analyzer, image, segmentation.mask)
+                results["measurements"] = measurements
+                artifacts.append(
+                    self.artifact_store.save_measurements(request.request_id, measurements)
+                )
+                summary = "Basic measurements computed."
 
-        if request.task == "morphology_summary":
-            yield {"type": "status", "message": "Generando resumen…"}
-            summary = tool_morphology_summary(
-                self.analyzer,
-                results["measurements"],
-            )
-            report_text = tool_generate_report(request.request_id, summary, results)
-            artifacts.append(self.artifact_store.save_report(request.request_id, report_text))
+            if request.task == "morphology_summary":
+                yield {"type": "status", "message": "Generando resumen…"}
+                morphology_text = tool_morphology_summary(
+                    self.analyzer,
+                    results["measurements"],
+                )
+                report_text = tool_generate_report(request.request_id, morphology_text, results)
+                artifacts.append(self.artifact_store.save_report(request.request_id, report_text))
+                if self.langchain_backend:
+                    target_name = (request.target and request.target.name) or "galaxia"
+                    opts = request.options or {}
+                    band = opts.get("band")
+                    effective_band = str(band) if band else "visible"
+                    summary = self.langchain_backend.generate_accompanying_summary(
+                        target_name=str(target_name),
+                        band=effective_band,
+                        morphology_summary=morphology_text,
+                        user_message=_last_user_message(request) or None,
+                    )
+                else:
+                    summary = morphology_text
 
         logger.info(
             "analysis_completed",

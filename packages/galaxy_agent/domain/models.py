@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-TaskType = Literal["morphology_summary", "segment", "measure_basic"]
+TaskType = Literal["morphology_summary", "segment", "measure_basic", "fetch_image"]
 ResponseStatus = Literal["success", "error"]
 ArtifactType = Literal["mask", "plot", "report", "image"]
 
@@ -33,6 +33,9 @@ class AnalyzeRequest(BaseModel):
     task: TaskType | None = None
     image_url: str | None = None
     options: dict[str, Any] = Field(default_factory=dict)
+    # Cuando la petición no está soportada: el agente responde con decline_message sin ejecutar pipeline
+    out_of_scope: bool = False
+    decline_message: str | None = None
 
     @model_validator(mode="after")
     def require_message_or_structured(self) -> AnalyzeRequest:
@@ -64,6 +67,8 @@ class AnalyzeRequest(BaseModel):
             task=task,
             image_url=self.image_url,
             options=self.options,
+            out_of_scope=self.out_of_scope,
+            decline_message=self.decline_message,
         )
 
 
