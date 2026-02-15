@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv(override=False)
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from apps.api.auth import verify_api_key
 from apps.api.config import Settings, get_settings
@@ -55,6 +56,26 @@ def analyze(
     runner: Annotated[AgentRunner, Depends(get_runner)],
 ) -> AnalyzeResponse:
     return runner.run(request)
+
+
+def _sse_stream(request: AnalyzeRequest, runner: AgentRunner):
+    """Yield SSE bytes: each event as data line + newlines."""
+    for event in runner.run_stream(request):
+        event_type = event.get("type", "message")
+        line = f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
+        yield line.encode("utf-8")
+
+
+@app.post("/analyze/stream", dependencies=[Depends(verify_api_key)])
+def analyze_stream(
+    request: AnalyzeRequest,
+    runner: Annotated[AgentRunner, Depends(get_runner)],
+) -> StreamingResponse:
+    return StreamingResponse(
+        _sse_stream(request, runner),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/artifacts/{request_id}/image", dependencies=[Depends(verify_api_key)])

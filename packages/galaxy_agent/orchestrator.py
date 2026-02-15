@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator
 from typing import Any
 
 import requests
@@ -36,16 +37,38 @@ class TaskOrchestrator:
         self.artifact_store = artifact_store
 
     def run(self, request: AnalyzeRequest, langsmith_enabled: bool) -> AnalyzeResponse:
-        artifacts = []
+        for event in self.run_stream(request, langsmith_enabled):
+            if event.get("type") == "end":
+                artifacts_d = event.get("artifacts", [])
+                prov = event.get("provenance")
+                return AnalyzeResponse(
+                    request_id=event["request_id"],
+                    status=event["status"],
+                    summary=event.get("summary", ""),
+                    results=event.get("results", {}),
+                    artifacts=[Artifact(**a) for a in artifacts_d],
+                    provenance=Provenance(**prov) if isinstance(prov, dict) else prov,
+                    warnings=event.get("warnings", []),
+                )
+            if event.get("type") == "error":
+                raise RuntimeError(event.get("message", "Unknown error"))
+        raise RuntimeError("Stream ended without end event")
+
+    def run_stream(
+        self, request: AnalyzeRequest, langsmith_enabled: bool
+    ) -> Iterator[dict[str, Any]]:
+        artifacts: list[Artifact] = []
         warnings: list[str] = []
 
-        # No image yet: resolve target → get URL → download → save for analysis.
         if request.image_url is None and request.target is not None:
+            yield {"type": "status", "message": "Resolviendo galaxia y descargando imagen…"}
             request = self._resolve_fetch_and_download(request)
+            yield {"type": "status", "message": "Imagen descargada."}
 
         if request.image_url:
             artifacts.append(Artifact(type="image", path=request.image_url))
 
+        yield {"type": "status", "message": "Segmentando imagen…"}
         image = load_image(request.image_url)
         segmentation = tool_segment(self.analyzer, image)
         artifacts.append(self.artifact_store.save_mask(request.request_id, segmentation.mask))
@@ -54,6 +77,7 @@ class TaskOrchestrator:
         summary = "Segmentation completed."
 
         if request.task in ("measure_basic", "morphology_summary"):
+            yield {"type": "status", "message": "Calculando medidas…"}
             measurements = tool_measure_basic(self.analyzer, image, segmentation.mask)
             results["measurements"] = measurements
             artifacts.append(
@@ -62,6 +86,7 @@ class TaskOrchestrator:
             summary = "Basic measurements computed."
 
         if request.task == "morphology_summary":
+            yield {"type": "status", "message": "Generando resumen…"}
             summary = tool_morphology_summary(
                 self.analyzer,
                 results["measurements"],
@@ -74,9 +99,22 @@ class TaskOrchestrator:
             extra={"request_id": request.request_id, "task": request.task, "event": "analysis"},
         )
 
-        return self._build_response(
+        response = self._build_response(
             request, summary, results, artifacts, warnings, langsmith_enabled
         )
+        yield {"type": "summary", "summary": response.summary}
+        if artifacts:
+            yield {"type": "artifacts", "request_id": request.request_id}
+        yield {
+            "type": "end",
+            "request_id": response.request_id,
+            "status": response.status,
+            "summary": response.summary,
+            "results": response.results,
+            "artifacts": [a.model_dump() for a in response.artifacts],
+            "provenance": response.provenance.model_dump(),
+            "warnings": response.warnings,
+        }
 
     def _resolve_fetch_and_download(self, request: AnalyzeRequest) -> AnalyzeRequest:
         """Resolve target (by name or options ra_deg/dec_deg), get image URL, download, save.

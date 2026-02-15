@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from typing import Any
 
 from packages.galaxy_agent.artifacts import ArtifactStore
 from packages.galaxy_agent.domain.models import TaskType
@@ -77,3 +79,19 @@ class AgentRunner:
         """Scaffold: future LLM tool-calling runs here; uses normalized messages when present."""
         _ = self.langchain_backend.build_prompt(request)
         _ = self.langchain_backend.plan_tool_calls(request)
+
+    def run_stream(self, request: AnalyzeRequest) -> Iterator[dict[str, Any]]:
+        """Yields SSE-style events: status, summary, artifacts, end (or error)."""
+        try:
+            enriched = self.langchain_backend.enrich_request(request)
+            resolved = self._resolve_request(enriched)
+            self._prepare_llm_plan(resolved)
+            yield from self.orchestrator.run_stream(
+                request=resolved, langsmith_enabled=self.langsmith_enabled
+            )
+        except Exception as e:
+            logger.exception(
+                "analysis_failed",
+                extra={"request_id": request.request_id, "event": "error"},
+            )
+            yield {"type": "error", "message": str(e)}
